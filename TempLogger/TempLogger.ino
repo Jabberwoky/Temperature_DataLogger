@@ -3,10 +3,13 @@
  Reads an analog input pinand prints the results to the serial monitor.
 
  The circuit:
- A0 connected to the output pin of AD8495 Adafruit thermocouple module. 
+ A0, A1 and A2 connected to the output pins of AD8495 Adafruit thermocouple modules. 
+ DUT is WPC1 with Tx sent to pin 8. 
+ Note: WPC1 is a 3.3V tool so serial must be level shifted. 
+ Note: WPC1 Rx pin should be tied High (3.3V) 
 
  Author: Demian Mendez
- Last edited: 6/8/2017
+ Last edited: 9/19/2017
  */
 #include <SPI.h>
 #include <SD.h>
@@ -15,21 +18,22 @@
 #include <SoftwareSerial.h>
 SoftwareSerial mySerial(8, 9);//rx tx
 
-//  defines
+// Definitions //////////////////////////////////////////////////
 #define LOG_INTERVAL 1000 //mills between entries 
 #define SYNC_INTERVAL 1000 // mills between calls to flush() - to write data to the card
 
 #define ECHO_TO_SERIAL   1 // echo data to serial port
 #define WAIT_TO_START    0 // Wait for serial input in setup()
-// Pin Assignments pins that connect to the LEDs
+  
+  // Pin Assignments pins that connect to the LEDs
 #define redLEDpin 2
 #define greenLEDpin 3
-#define clamp1Pin A0  // AD8495 Thermocouple input
-#define ATC1Pin A1  // AD8495 Thermocouple input
-#define clamp2Pin A2  // AD8495 Thermocouple input
+#define clamp1Pin  A0  // AD8495 Thermocouple input
+#define AmbientPin A1  // AD8495 Thermocouple input
+#define clamp2Pin  A2  // AD8495 Thermocouple input
 
 
-// Variable initializations
+// Variable initializations/////////////////////////////////////
 uint32_t syncTime = 0;    // time of last sync()
 
 float clamp1V = 0.0;  
@@ -37,44 +41,37 @@ float clamp1avgV = 0.0;  // Sets start point for T/C to around 70°F
 float clamp1TempC = 0.0;
 float clamp1TempF = 0.0;
 
-float ATC1V = 0.0;  
-float ATC1avgV = 0.0;  // Sets start point for T/C to around 70°F
-float ATC1TempC = 0.0;
-float ATC1TempF = 0.0;
+float AmbientV = 0.0;  
+float AmbientavgV = 0.0;  // Sets start point for T/C to around 70°F
+float AmbientTempC = 0.0;
+float AmbientTempF = 0.0;
 
 float clamp2V = 0.0;  
 float clamp2avgV = 0.0;  // Sets start point for boxPin to around 70°F
 float clamp2TempC = 0.0;
 float clamp2TempF = 0.0;
 
-float EMA_a = 0.08; // Constant for Smoothing filter larger value places more weight on current reading. Value should be between 0 and 1
+float EMA_a = 0.05;   // Constant for Smoothing filter larger value places more weight on current reading. Value should be between 0 and 1
+int firstPass = 0;    // Use for the averaging function on first pass. 
 
+  // WPC1 Variables
 float DUT_Temp = 0.0;
-int value;  //raw hex value read in serial from DUT_thermistor
-byte msb, lsb;
 
-int firstPass = 0;    //Use for the averaging function on first pass. 
-
-//Setting up the Datalogging sheild
+  //Setting up the Datalogging sheild
 RTC_PCF8523 rtc; // define the Real Time Clock object
-// for the data logging shield, we use digital pin 10 for the SD cs line
+  // for the data logging shield, we use digital pin 10 for the SD cs line
 const int chipSelect = 10; 
-// the logging file
+  // the logging file
 File logfile;
 
-//Error check function if we can't write to the SD card or open it.
-void error(char *str)
-{
-  Serial.print("error: ");
-  Serial.println(str);
-  
-  // red LED indicates error
-  digitalWrite(redLEDpin, HIGH);
+///FUNCTION PROTOTYPES  //////////////////////////////////////////
+void error(char *str);
+void getDutData();
+long readVcc();
+float getVout(int pin, double Vcc);
+float ema(float EMA_A, float currentVal, float previousVal);
 
-  while(1);
-}
-
-// Begin SETUP///////////////////////////////////////////////////////
+// SETUP /////////////////////////////////////////////////////////
 void setup() {
   // initialize serial communications at 9600 bps:
   Serial.begin(19200);
@@ -126,23 +123,23 @@ void setup() {
 #endif  //ECHO_TO_SERIAL
   }
   
-  logfile.println("date,time,C1,ATC1,WPC1,C2");    
+  logfile.println("date,time,Pipe1,Ambient,WPC1,Pipe2");    
 #if ECHO_TO_SERIAL
-  Serial.println("date,time,C1,ATC1,WPC1,C2");
+  Serial.println("date,time,Pipe1,Ambient,WPC1,Pipe2");
 #endif //ECHO_TO_SERIAL
 }
 
 
-/// BEGIN MAIN/////////////////////////////////////////////////////
+/// MAIN /////////////////////////////////////////////////////
 void loop() {
   DateTime now;
 
   // delay for the amount of time we want between readings
   delay((LOG_INTERVAL -1) - (millis() % LOG_INTERVAL));
 
-   digitalWrite(greenLEDpin, HIGH);
+  digitalWrite(greenLEDpin, HIGH);
 
-    // log milliseconds since starting
+  // log milliseconds since starting
   uint32_t m = millis();
 //  logfile.print(m);           // milliseconds since start
 //  logfile.print(", ");    
@@ -187,55 +184,44 @@ void loop() {
 //  Serial.print('"');
 #endif //ECHO_TO_SERIAL
   
-  // Get the Temperature from the DUT
-  //// Product Info Request 0d105 = 0x69
-  //// Temperature Request 0d150 = 0x96
-  
-  mySerial.write(150); // Send request for temperature data
-  if(mySerial.available()>0){
-      msb = mySerial.read();
-      lsb = mySerial.read();
-      mySerial.flush();
-      value = (msb << 8 ) | lsb;
-      DUT_Temp = value*0.10; // Divide by 10 to get °F
-      //DUT_Temp = (value*0.18)+32; //Convert from value to temperature Fahrenheit
-  }
+  // Get the Temperature from the DUT    
+  getDutData();
   
   // Get reference supply voltage for reference:
   double Vcc = readVcc()/1000.0;
   
   // read the T/C voltages:
-  clamp1V = getVout(clamp1Pin, Vcc)*2; // Time 2 multiplier for volatage divider in circuit
-  ATC1V   = getVout(ATC1Pin, Vcc)*2;
-  clamp2V = getVout(clamp2Pin, Vcc)*2;
+  clamp1V   = getVout(clamp1Pin, Vcc)*2; // Time 2 multiplier for volatage divider in circuit
+  AmbientV  = getVout(AmbientPin, Vcc)*2;
+  clamp2V   = getVout(clamp2Pin, Vcc)*2;
 
   //Check to see if this is the first time through if so use the readings twice for averaging. 
   if (firstPass < 1)
   {
     clamp1avgV = clamp1V;
-    ATC1avgV   = ATC1V;
+    AmbientavgV   = AmbientV;
     clamp2avgV = clamp2V;
     firstPass++;
   }
 
   //Exponential Moving Average for AD8495
-  clamp1avgV = ema(EMA_a, clamp1V, clamp1avgV);
-  ATC1avgV   = ema(EMA_a, ATC1V, ATC1avgV);
-  clamp2avgV = ema(EMA_a, clamp2V, clamp2avgV);
+  clamp1avgV    = ema(EMA_a, clamp1V, clamp1avgV);
+  AmbientavgV   = ema(EMA_a, AmbientV, AmbientavgV);
+  clamp2avgV    = ema(EMA_a, clamp2V, clamp2avgV);
   
   //Calculate T/C Temperature °C AD8495
-  clamp1TempC = (clamp1avgV - 1.25) / 0.005;
-  ATC1TempC   = (ATC1avgV -1.25) / 0.005;
-  clamp2TempC = (clamp2avgV - 1.25) / 0.005;
+  clamp1TempC    = (clamp1avgV - 1.25) / 0.005;
+  AmbientTempC   = (AmbientavgV -1.25) / 0.005;
+  clamp2TempC    = (clamp2avgV - 1.25) / 0.005;
   //Convert °C to °F
-  clamp1TempF =  (clamp1TempC*1.8)+32;
-  ATC1TempF = (ATC1TempC*1.8)+32;
-  clamp2TempF =  (clamp2TempC*1.8)+32;
+  clamp1TempF  = (clamp1TempC*1.8)+32;
+  AmbientTempF = (AmbientTempC*1.8)+32;
+  clamp2TempF  = (clamp2TempC*1.8)+32;
 
   logfile.print(", ");    
   logfile.print(clamp1TempF);
   logfile.print(", ");    
-  logfile.print(ATC1TempF);
+  logfile.print(AmbientTempF);
   logfile.print(", ");    
   logfile.print(DUT_Temp);
   logfile.print(", ");    
@@ -244,7 +230,7 @@ void loop() {
   Serial.print(", ");   
   Serial.print(clamp1TempF);
   Serial.print(", ");   
-  Serial.print(ATC1TempF);
+  Serial.print(AmbientTempF);
   Serial.print(", ");    
   Serial.print(DUT_Temp);
   Serial.print(", ");    
@@ -268,17 +254,42 @@ void loop() {
   logfile.flush();
   digitalWrite(redLEDpin, LOW);
 }
+///////// END MAIN /////////////////////////////////////////////////////////////////////////
 
 
 // Supporting Functions
 //+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+//getDutData() 
+//Description: Reads in the serial data from WPC1 and formats it to XX.X°F
+//Takes: N/A
+//Returns:  N/A
+//===================================================================================
+void getDutData(){
+  int value;      //raw hex value read in serial from DUT_thermistor
+  byte msb, lsb;  // bytes making up temp reading
+  const byte numBytes = 12;  // Full packet size sent by WPC1
+  byte rxPacket[numBytes];   // array to store the received packet
+  byte endMarker = 170;
+  
+  if(mySerial.available()){
+     mySerial.readBytesUntil(endMarker,rxPacket,numBytes);
+     msb = rxPacket[9];
+     lsb = rxPacket[10];
+     value = (msb << 8) | lsb;
+     DUT_Temp = value*0.1;   //Divide by 10 to get °F
+  }
+  else {
+    DUT_Temp = 0;
+  }
+}
 
 //readVCC() 
 //Description: Measures this 1.1V reference voltage, and uses the resultant ADV value 
 //             to work out what the supply voltage must be.
 //Takes: N/A
 //Returns:  Vcc in mV
-/////////////////////////////////////////////////////////////////////////
+//===================================================================================
 long readVcc() {
   long result;
   // Read 1.1V reference against AVcc
@@ -296,7 +307,7 @@ long readVcc() {
 //Reads the analogue sensor value and converts it to a voltage. 
 //Takes: Analogue pin to be measured, and supply voltage
 //Returns: Vout sensor voltage
-//////////////////////////////////////////////////////////////////////////
+//===================================================================================
 float getVout(int pin, double Vcc)
 { 
   int sensVal = analogRead(pin); // Reads in int between 0 and 1023
@@ -315,4 +326,15 @@ float ema(float EMA_A, float currentVal, float previousVal)
 }
 
 
+//Error check function if we can't write to the SD card or open it. 
+//===================================================================================
+void error(char *str)
+{
+  Serial.print("error: ");
+  Serial.println(str);
+  
+  // red LED indicates error
+  digitalWrite(redLEDpin, HIGH);
 
+  while(1);
+}
