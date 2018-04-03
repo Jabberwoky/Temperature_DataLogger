@@ -51,7 +51,7 @@ float clamp2avgV = 0.0;  // Sets start point for boxPin to around 70°F
 float clamp2TempC = 0.0;
 float clamp2TempF = 0.0;
 
-float EMA_a = 0.05;   // Constant for Smoothing filter larger value places more weight on current reading. Value should be between 0 and 1
+float EMA_a = 0.0625; //0.5 For Calibration  // Constant for Smoothing filter larger value places more weight on current reading. Value should be between 0 and 1
 int firstPass = 0;    // Use for the averaging function on first pass. 
 
   // WPC1 Variables
